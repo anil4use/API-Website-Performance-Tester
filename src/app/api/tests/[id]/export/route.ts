@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getOrchestrator } from '@/lib/engine/orchestrator'
-import { getHistoryEntry } from '@/lib/db'
 import type { TestReport, ExportFormat } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
@@ -11,12 +10,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     const format = (req.nextUrl.searchParams.get('format') ?? 'json') as ExportFormat
 
     const orch = getOrchestrator()
-    let report: TestReport | null = orch.getReport(id)
-
-    if (!report) {
-      const entry = await getHistoryEntry(id)
-      if (entry) report = JSON.parse(entry.reportSnapshot)
-    }
+    const report: TestReport | null = orch.getReport(id)
 
     if (!report) {
       return NextResponse.json({ error: 'Report not found' }, { status: 404 })

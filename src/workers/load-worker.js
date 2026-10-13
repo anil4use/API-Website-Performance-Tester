@@ -30,7 +30,15 @@ let gRefillPerMs = Infinity
 let gLastRefill = 0
 
 function initGlobalRateLimit() {
-  const rps = config.bypass?.maxRps
+  // For breakpoint mode, we never rate-limit — we push as hard as possible and measure
+  // what actually gets through. Rate limiting would defeat the purpose of a breakpoint test.
+  if (config.testType === 'breakpoint') return
+
+  // Support target RPS from bypass.maxRps, load.requestsPerSecond
+  const rps = config.bypass?.maxRps ||
+    config.load?.requestsPerSecond ||
+    0
+
   if (rps && rps > 0) {
     gMaxTokens = rps
     gTokens = rps
@@ -40,7 +48,7 @@ function initGlobalRateLimit() {
 }
 
 async function acquireGlobalToken() {
-  if (!config.bypass?.maxRps || config.bypass.maxRps <= 0) return
+  if (gMaxTokens === Infinity) return
   while (true) {
     const now = Date.now()
     const elapsed = now - gLastRefill
@@ -50,7 +58,7 @@ async function acquireGlobalToken() {
       gTokens -= 1
       return
     }
-    await sleep(20)
+    await sleep(2)
   }
 }
 
@@ -196,15 +204,29 @@ function runSingleRequest() {
 const pendingResults = []
 const pendingLogs = []
 let lastMetricsSend = Date.now()
+let breakingPointMarker = null
+let aborted = false
+let abortReason = ''
+let consecutiveTimeouts = 0
+let peakInFlight = 0  // real max concurrent connections ever open simultaneously
 
 function maybeSendMetrics(force) {
   const now = Date.now()
-  if (force || now - lastMetricsSend >= 500) {
+  if (force || now - lastMetricsSend >= 400) {
     const toSend = pendingResults.splice(0)
     const logs = pendingLogs.splice(0)
     parentPort.postMessage({
       type: 'metrics',
-      data: { newResults: toSend, currentConcurrency, stressLevel: undefined, logs },
+      data: {
+        newResults: toSend,
+        currentConcurrency,
+        peakInFlight,  // actual max concurrent connections ever open (honest VU count)
+        stressLevel: undefined,
+        breakingPoint: breakingPointMarker,
+        aborted,
+        abortReason,
+        logs,
+      },
     })
     lastMetricsSend = now
   }
@@ -267,11 +289,12 @@ async function runLoadTest() {
   const totalRequests = load.totalRequests || Infinity
   const durationMs = load.duration ? load.duration * 1000 : Infinity
   const rampUpMs = (load.rampUpTime || 0) * 1000
+  const rampDownMs = (load.rampDownTime || 0) * 1000
   const startTime = Date.now()
 
   currentConcurrency = rampUpMs > 0 ? 1 : concurrency
 
-  // Ramp up
+  // Ramp up timer
   let rampTimer = null
   if (rampUpMs > 0) {
     const steps = Math.min(concurrency, 20)
@@ -284,6 +307,25 @@ async function runLoadTest() {
         rampTimer = null
       }
     }, stepInterval)
+  }
+
+  // Ramp down timer (triggered when approaching end of duration)
+  let rampDownTimer = null
+  let rampDownScheduled = null
+  if (rampDownMs > 0 && durationMs < Infinity && durationMs > rampDownMs) {
+    const rampDownStartOffset = durationMs - rampDownMs
+    rampDownScheduled = setTimeout(() => {
+      const steps = Math.min(concurrency, 20)
+      const stepInterval = rampDownMs / steps
+      const stepSize = Math.max(1, Math.floor(concurrency / steps))
+      rampDownTimer = setInterval(() => {
+        currentConcurrency = Math.max(1, currentConcurrency - stepSize)
+        if (currentConcurrency <= 1) {
+          clearInterval(rampDownTimer)
+          rampDownTimer = null
+        }
+      }, stepInterval)
+    }, rampDownStartOffset)
   }
 
   async function runSlot() {
@@ -301,6 +343,8 @@ async function runLoadTest() {
 
   await Promise.all(Array.from({ length: concurrency }, () => runSlot()))
   if (rampTimer) clearInterval(rampTimer)
+  if (rampDownTimer) clearInterval(rampDownTimer)
+  if (rampDownScheduled) clearTimeout(rampDownScheduled)
   maybeSendMetrics(true)
 }
 
@@ -327,9 +371,36 @@ async function runStressTest() {
 
   const levels = stress.levels || [10, 25, 50, 100, 250, 500]
   const levelDurationMs = (stress.levelDuration || 30) * 1000
+  const rampBetweenMs = (stress.rampBetweenLevels || 0) * 1000
 
-  for (const level of levels) {
+  for (let i = 0; i < levels.length; i++) {
     if (stopped) break
+    const level = levels[i]
+
+    // If rampBetweenLevels is configured and not the first level, smoothly ramp from previous level
+    if (rampBetweenMs > 0 && i > 0) {
+      const prevLevel = levels[i - 1]
+      const rampStart = Date.now()
+      const rampSlots = Math.max(prevLevel, level)
+      activeSlots = 0
+
+      async function rampSlot() {
+        activeSlots++
+        while (!stopped && Date.now() - rampStart < rampBetweenMs) {
+          if (paused) { await waitWhilePaused(); continue }
+          const progress = Math.min(1, (Date.now() - rampStart) / rampBetweenMs)
+          currentConcurrency = Math.round(prevLevel + (level - prevLevel) * progress)
+          if (activeSlots > currentConcurrency) { await sleep(10); continue }
+          totalSent++
+          await executeRequest()
+        }
+        activeSlots--
+      }
+
+      await Promise.all(Array.from({ length: rampSlots }, () => rampSlot()))
+      if (stopped) break
+    }
+
     currentConcurrency = level
     parentPort.postMessage({ type: 'metrics', data: { newResults: [], currentConcurrency: level, stressLevel: level } })
     await runPhase(level, levelDurationMs)
@@ -380,6 +451,218 @@ async function runRateLimitTest() {
   maybeSendMetrics(true)
 }
 
+async function runBreakpointTest() {
+  const bp = config.breakpoint
+  if (!bp) return
+
+  const targetVUs = bp.targetVirtualUsers || 10000
+  const burstDurationMs = (bp.burstDurationSeconds || 5) * 1000
+  const abortConds = bp.abortConditions || { maxErrorRatePercent: 50, maxP99LatencyMs: 30000, consecutiveTimeoutLimit: 500 }
+  const rampStrategy = bp.rampStrategy || 'instant'
+
+  // ── Persistent keep-alive connection pool ─────────────────────────────────
+  // With keepAlive:false (the default), every request = a fresh TLS handshake.
+  // Cloudflare / CDNs see this as a SYN flood and hold each connection for
+  // 7-10 seconds before RST-ing it ("slow reset" DDoS defense).
+  //
+  // With keepAlive:true and a controlled pool size, we reuse connections:
+  //   - Far fewer TLS handshakes = lower per-request overhead
+  //   - CDN sees steady HTTP traffic, not a SYN flood — much less aggressive blocking
+  //   - Each persistent connection can serve many requests in sequence
+  //   - Realistic throughput: pool_size × (1000ms / avg_RTT_ms) = RPS estimate
+  //
+  // Pool size: min(targetVUs, 5000). For a public HTTPS site:
+  //   500 connections × (1000ms / 200ms RTT) ≈ 2,500 RPS
+  //   5000 connections × (1000ms / 200ms RTT) ≈ 25,000 RPS (if server keeps up)
+  const bpPoolSize = Math.min(targetVUs, 5000)
+  const bpHttpsAgent = new https.Agent({
+    maxSockets: bpPoolSize,
+    keepAlive: true,
+    keepAliveMsecs: 10000,
+    maxFreeSockets: Math.min(bpPoolSize, 1000),
+    scheduling: 'lifo',
+  })
+  const bpHttpAgent = new http.Agent({
+    maxSockets: bpPoolSize,
+    keepAlive: true,
+    keepAliveMsecs: 10000,
+    maxFreeSockets: Math.min(bpPoolSize, 1000),
+    scheduling: 'lifo',
+  })
+  // Temporarily override global agents for this test
+  const prevHttpsAgent = https.globalAgent
+  const prevHttpAgent = http.globalAgent
+  https.globalAgent = bpHttpsAgent
+  http.globalAgent = bpHttpAgent
+
+  const startTime = Date.now()
+  const burstEndTime = startTime + burstDurationMs
+  let inFlight = 0
+  let recentWindow = []
+
+  // Concurrency initialization
+  if (rampStrategy === 'instant') {
+    currentConcurrency = targetVUs
+  } else {
+    currentConcurrency = 1
+  }
+
+  // Micro-ramp timers
+  let rampTimer = null
+  if (rampStrategy === 'ramp_100ms') {
+    const rampStart = Date.now()
+    rampTimer = setInterval(() => {
+      const progress = Math.min(1, (Date.now() - rampStart) / 100)
+      currentConcurrency = Math.max(1, Math.floor(targetVUs * progress))
+      if (progress >= 1) {
+        clearInterval(rampTimer)
+        rampTimer = null
+      }
+    }, 10)
+  } else if (rampStrategy === 'ramp_1s') {
+    const rampStart = Date.now()
+    rampTimer = setInterval(() => {
+      const progress = Math.min(1, (Date.now() - rampStart) / 1000)
+      currentConcurrency = Math.max(1, Math.floor(targetVUs * progress))
+      if (progress >= 1) {
+        clearInterval(rampTimer)
+        rampTimer = null
+      }
+    }, 25)
+  }
+
+  // 250ms Abort Condition Monitor
+  const abortMonitor = setInterval(() => {
+    if (stopped) return
+
+    const now = Date.now()
+    recentWindow = recentWindow.filter(r => now - r.ts <= 1500)
+    if (recentWindow.length >= 10) {
+      const failed = recentWindow.filter(r => r.statusCode === 0 || r.statusCode >= 400).length
+      const errorRate = (failed / recentWindow.length) * 100
+
+      const sortedTimes = recentWindow.map(r => r.responseTime).sort((a, b) => a - b)
+      const p99Idx = Math.max(0, Math.ceil(0.99 * sortedTimes.length) - 1)
+      const p99 = sortedTimes[p99Idx] || 0
+
+      const windowSec = Math.max(0.2, (now - (recentWindow[0]?.ts || now)) / 1000)
+      const currentRps = recentWindow.length / windowSec
+
+      let tripped = false
+      let reason = ''
+
+      if (abortConds.maxErrorRatePercent > 0 && errorRate > abortConds.maxErrorRatePercent) {
+        tripped = true
+        reason = `Auto-abort: Error rate reached ${errorRate.toFixed(1)}% (limit: ${abortConds.maxErrorRatePercent}%)`
+      } else if (abortConds.maxP99LatencyMs > 0 && p99 > abortConds.maxP99LatencyMs) {
+        tripped = true
+        reason = `Auto-abort: p99 latency reached ${Math.round(p99)}ms (limit: ${abortConds.maxP99LatencyMs}ms)`
+      } else if (abortConds.consecutiveTimeoutLimit > 0 && consecutiveTimeouts >= abortConds.consecutiveTimeoutLimit) {
+        tripped = true
+        reason = `Auto-abort: Consecutive timeouts reached ${consecutiveTimeouts} (limit: ${abortConds.consecutiveTimeoutLimit})`
+      }
+
+      if (tripped) {
+        stopped = true
+        aborted = true
+        abortReason = reason
+        breakingPointMarker = {
+          timestamp: now,
+          rps: Math.round(currentRps),
+          concurrency: currentConcurrency,
+          reason,
+          errorRate,
+          p99,
+          consecutiveTimeouts,
+        }
+        clearInterval(abortMonitor)
+        if (rampTimer) clearInterval(rampTimer)
+      }
+    }
+  }, 250)
+
+  // ── True fire-and-forget concurrency dispatcher ──────────────────────────────
+  // Instead of N sequential slots each awaiting one request at a time,
+  // we fire requests as fast as the event loop allows and track in-flight count.
+  // This is the only way to approach the configured RPS from a single process.
+  //
+  // Hard cap: Node.js is physically limited to ~5,000-15,000 concurrent outbound
+  // HTTPS connections before the OS/NIC becomes the bottleneck. We respect that
+  // by capping in-flight at min(targetVUs, bpPoolSize). The actual achieved RPS will
+  // be bounded by: min(targetRps, inFlight / avgLatencySeconds).
+  const MAX_INFLIGHT = bpPoolSize
+
+  async function fireLoop() {
+    while (!stopped && Date.now() < burstEndTime) {
+      if (paused) { await waitWhilePaused(); continue }
+
+      // Respect ramp strategy: if ramp is still climbing, cap in-flight to currentConcurrency
+      if (inFlight >= Math.min(currentConcurrency, MAX_INFLIGHT)) {
+        // Yield to let the event loop process completions
+        await sleep(1)
+        continue
+      }
+
+      totalSent++
+      inFlight++
+      if (inFlight > peakInFlight) peakInFlight = inFlight  // track real peak
+
+      // Fire request without awaiting — true non-blocking dispatch
+      runSingleRequest().then((res) => {
+        inFlight--
+        pendingResults.push(res)
+        pendingLogs.push({
+          ts: res.timestamp,
+          s: res.statusCode,
+          l: Math.round(res.responseTime),
+          e: res.error || null,
+          sz: res.responseSize,
+          bs: res.bodySnippet || null,
+        })
+        recentWindow.push({
+          ts: res.timestamp,
+          statusCode: res.statusCode,
+          responseTime: res.responseTime,
+          isTimeout: res.isTimeout,
+        })
+        if (res.isTimeout) {
+          consecutiveTimeouts++
+        } else {
+          consecutiveTimeouts = 0
+        }
+        maybeSendMetrics()
+      }).catch(() => {
+        inFlight--
+      })
+    }
+  }
+
+  // Run multiple parallel fire-loops to overcome single-loop event tick limits
+  // Each loop independently checks in-flight count, so they cooperate naturally.
+  const NUM_FIRE_LOOPS = Math.min(32, Math.max(4, Math.ceil(targetVUs / 1000)))
+  await Promise.all(Array.from({ length: NUM_FIRE_LOOPS }, () => fireLoop()))
+
+  clearInterval(abortMonitor)
+  if (rampTimer) clearInterval(rampTimer)
+
+  // Graceful drain — wait until all in-flight requests complete (or request timeout expires).
+  // CRITICAL: With an external site like Cloudflare that holds connections for 7-10s before
+  // RST-ing them, we MUST wait at least that long or fired requests are silently discarded.
+  const drainMs = Math.max(15000, config.timeout || 30000)
+  const drainDeadline = Date.now() + drainMs
+  while (inFlight > 0 && Date.now() < drainDeadline) {
+    await sleep(100)
+  }
+
+  // Restore original agents
+  https.globalAgent = prevHttpsAgent
+  http.globalAgent = prevHttpAgent
+  bpHttpsAgent.destroy()
+  bpHttpAgent.destroy()
+
+  maybeSendMetrics(true)
+}
+
 ;(async () => {
   initGlobalRateLimit()
   try {
@@ -389,6 +672,7 @@ async function runRateLimitTest() {
       case 'spike': await runSpikeTest(); break
       case 'endurance': await runEnduranceTest(); break
       case 'rate-limit': await runRateLimitTest(); break
+      case 'breakpoint': await runBreakpointTest(); break
       default: await runLoadTest()
     }
     parentPort.postMessage({ type: 'done' })

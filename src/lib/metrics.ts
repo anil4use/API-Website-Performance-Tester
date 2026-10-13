@@ -173,6 +173,21 @@ export function generateObservations(metrics: AggregatedMetrics, testType: strin
     obs.push('Rate limit test: requests were sent to observe rate limiting behavior. HTTP 429 counts indicate the limit threshold.')
   } else if (testType === 'endurance') {
     obs.push('Endurance test: sustained load was applied over time. Review the time series for any gradual degradation patterns.')
+  } else if (testType === 'breakpoint') {
+    if (metrics.aborted && metrics.breakingPoint) {
+      obs.push(`BREAKING POINT TRIPPED at ${new Date(metrics.breakingPoint.timestamp).toLocaleTimeString()}: ${metrics.breakingPoint.reason} (Load: ${metrics.breakingPoint.rps.toLocaleString()} RPS at ${metrics.breakingPoint.concurrency.toLocaleString()} VUs).`)
+    } else {
+      obs.push(`Target survived the full extreme burst duration without tripping abort thresholds. Peak throughput achieved: ${(metrics.achievedRps ?? Math.round(requestsPerSecond)).toLocaleString()} RPS.`)
+    }
+    if (metrics.bottleneckHint) {
+      obs.push(`Bottleneck diagnosis: ${metrics.bottleneckHint}`)
+    }
+    if (metrics.honestyCheck) {
+      obs.push(`Test-rig honesty check: ${metrics.honestyCheck.message}`)
+    }
+    if (metrics.recoveryTimeMs && metrics.recoveryTimeMs > 0) {
+      obs.push(`Estimated post-burst recovery time: ${(metrics.recoveryTimeMs / 1000).toFixed(1)}s.`)
+    }
   }
 
   return obs

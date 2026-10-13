@@ -2,7 +2,7 @@
 
 import { fmtMs, fmtNumber, fmtRps, cn } from '@/lib/utils'
 import type { AggregatedMetrics } from '@/lib/types'
-import { CheckCircle2, XCircle, AlertTriangle, Loader2, Timer } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertTriangle, Loader2, Timer, Flame } from 'lucide-react'
 
 interface MetricCardProps {
   label: string
@@ -45,6 +45,22 @@ export default function LiveMetrics({ metrics, status, elapsed }: Props) {
 
   return (
     <div className="space-y-4 fade-in">
+      {/* Auto-abort breaking point alert */}
+      {metrics.aborted && metrics.breakingPoint && (
+        <div className="bg-rose-950/40 border border-rose-800/60 rounded-xl px-4 py-3 text-rose-200 flex items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5">
+            <Flame size={16} className="text-rose-400 shrink-0" />
+            <div>
+              <span className="font-bold uppercase tracking-wider text-rose-400">Breaking Point Reached:</span>
+              <span className="ml-1 text-rose-200">{metrics.breakingPoint.reason}</span>
+            </div>
+          </div>
+          <div className="font-mono text-right text-rose-300 font-bold shrink-0">
+            {fmtNumber(metrics.breakingPoint.rps)} RPS @ {fmtNumber(metrics.breakingPoint.concurrency)} VUs
+          </div>
+        </div>
+      )}
+
       {/* Status bar */}
       <div className="flex items-center justify-between bg-[#0d1b2e] border border-[#1a3352] rounded-lg px-4 py-3">
         <div className="flex items-center gap-3">
@@ -69,8 +85,13 @@ export default function LiveMetrics({ metrics, status, elapsed }: Props) {
           {metrics.stressLevel !== undefined && (
             <span className="text-xs text-slate-500">Level: {metrics.stressLevel} users</span>
           )}
+          {metrics.targetRps !== undefined && (
+            <span className="text-xs text-rose-400 font-mono">
+              Target: {fmtNumber(metrics.targetRps)} RPS
+            </span>
+          )}
         </div>
-        <div className="flex items-center gap-1 text-xs text-slate-500">
+        <div className="flex items-center gap-1 text-xs text-slate-500 font-mono">
           <Timer size={12} />
           {fmtMs(elapsed)}
         </div>

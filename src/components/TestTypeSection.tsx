@@ -1,6 +1,6 @@
 'use client'
 
-import { Zap, BarChart2, TrendingUp, Activity, Clock, Shield, Globe, GitBranch } from 'lucide-react'
+import { Zap, BarChart2, TrendingUp, Activity, Clock, Shield, Globe, GitBranch, Flame } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TestType } from '@/lib/types'
 
@@ -40,6 +40,13 @@ const TEST_TYPES: TestTypeDef[] = [
     icon: Activity,
     description: 'Sudden traffic surge from baseline to peak, then recovery — measures resilience.',
     color: 'text-orange-400',
+  },
+  {
+    id: 'breakpoint',
+    label: 'Breakpoint Burst',
+    icon: Flame,
+    description: 'Extreme-scale burst test (up to 100k+ VUs, 1M+ RPS) to deliberately surface breaking points before production.',
+    color: 'text-rose-400',
   },
   {
     id: 'endurance',

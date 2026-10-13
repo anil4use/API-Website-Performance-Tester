@@ -7,6 +7,7 @@ export type TestType =
   | 'spike'
   | 'endurance'
   | 'rate-limit'
+  | 'breakpoint'
   | 'website'
   | 'scenario'
 
@@ -81,6 +82,26 @@ export interface RateLimitConfig {
   burstMode: boolean
 }
 
+// ─── Breakpoint / Extreme Burst Test ──────────────────────────────────────────
+
+export type BreakpointRampStrategy = 'instant' | 'ramp_100ms' | 'ramp_1s'
+
+export interface BreakpointAbortConditions {
+  maxErrorRatePercent: number     // e.g. 50 — auto-abort if exceeded
+  maxP99LatencyMs: number         // e.g. 30000 — auto-abort if exceeded
+  consecutiveTimeoutLimit: number // e.g. 500
+}
+
+export interface BreakpointConfig {
+  testType?: 'breakpoint'
+  targetVirtualUsers: number        // e.g. 100000
+  targetRequestsPerSecond: number   // e.g. 1000000
+  burstDurationSeconds: number      // e.g. 1-10
+  rampStrategy: BreakpointRampStrategy
+  distributedNodes: number          // e.g. 1 = local only, N = cluster
+  abortConditions: BreakpointAbortConditions
+}
+
 export interface ScenarioStep {
   id: string
   name: string
@@ -139,6 +160,7 @@ export interface TestConfig {
   spike?: SpikeConfig
   endurance?: EnduranceConfig
   rateLimit?: RateLimitConfig
+  breakpoint?: BreakpointConfig
   scenario?: ScenarioConfig
   bypass?: BypassOptions
   authorizedByUser: boolean
@@ -204,6 +226,40 @@ export interface AggregatedMetrics {
   errors: string[]
   timeSeries: TimeSeriesPoint[]
   stressLevel?: number
+  // Breakpoint specific additions
+  breakingPoint?: {
+    timestamp: number
+    rps: number
+    concurrency: number
+    reason: string
+    errorRate: number
+    p99: number
+    consecutiveTimeouts: number
+  }
+  achievedRps?: number
+  targetRps?: number
+  achievedVirtualUsers?: number
+  targetVirtualUsers?: number
+  recoveryTimeMs?: number
+  bottleneckHint?: string
+  honestyCheck?: {
+    discrepancy: boolean
+    achievedRps: number
+    targetRps: number
+    ratio: number
+    message: string
+    severity: 'ok' | 'warning' | 'critical'
+  }
+  aborted?: boolean
+  abortReason?: string
+  agentMetrics?: Record<string, {
+    agentId: string
+    name: string
+    rps: number
+    requests: number
+    errors: number
+    avgLatency: number
+  }>
 }
 
 // ─── Single Request ───────────────────────────────────────────────────────────
@@ -294,6 +350,8 @@ export interface WorkerConfig {
   spike?: SpikeConfig
   endurance?: EnduranceConfig
   rateLimit?: RateLimitConfig
+  breakpoint?: BreakpointConfig
+  bypass?: BypassOptions
 }
 
 export interface WorkerMetricsMessage {
@@ -302,6 +360,10 @@ export interface WorkerMetricsMessage {
     newResults: RequestResult[]
     currentConcurrency: number
     stressLevel?: number
+    breakingPoint?: any
+    aborted?: boolean
+    abortReason?: string
+    logs?: any[]
   }
 }
 
@@ -310,7 +372,40 @@ export interface WorkerDoneMessage {
   error?: string
 }
 
-export type WorkerMessage = WorkerMetricsMessage | WorkerDoneMessage
+export interface WorkerAbortedMessage {
+  type: 'aborted'
+  reason: string
+  breakingPoint?: any
+}
+
+export type WorkerMessage = WorkerMetricsMessage | WorkerDoneMessage | WorkerAbortedMessage
+
+// ─── Remote Agents & Distributed Testing ──────────────────────────────────────
+
+export interface RemoteAgent {
+  id: string
+  name: string
+  host: string
+  status: 'idle' | 'busy' | 'offline'
+  connectedAt: number
+  lastHeartbeat: number
+  capacityRps: number
+  capacityVUs: number
+  totalRequestsHandled: number
+  currentLoad?: {
+    testId: string
+    vus: number
+    rps: number
+  }
+}
+
+export interface ClusterStatus {
+  token: string
+  totalAgents: number
+  connectedAgents: RemoteAgent[]
+  singleNodeEstimatedRps: number
+  totalClusterEstimatedRps: number
+}
 
 // ─── Safety ───────────────────────────────────────────────────────────────────
 

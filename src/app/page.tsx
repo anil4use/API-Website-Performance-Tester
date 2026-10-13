@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { v4 as uuidv4 } from 'uuid'
-import { Play, Square, Pause, History, ChevronDown, ChevronUp, Loader2, Link2, Trash2, RefreshCw } from 'lucide-react'
+import { Play, Square, Pause, ChevronDown, ChevronUp, Loader2, Link2, Trash2, RefreshCw } from 'lucide-react'
 
 import TargetSection from '@/components/TargetSection'
 import RequestSection from '@/components/RequestSection'
@@ -13,13 +13,13 @@ import MetricCharts from '@/components/MetricCharts'
 import TestReportView from '@/components/TestReportView'
 import SingleRequestResultView from '@/components/SingleRequestResult'
 import SafetyModal from '@/components/SafetyModal'
-import HistoryPanel from '@/components/HistoryPanel'
 import LiveTerminal from '@/components/LiveTerminal'
 import BypassSection from '@/components/BypassSection'
+import BreakpointSection from '@/components/BreakpointSection'
 
 import type {
   TestType, RequestConfig, LoadConfig, StressConfig, SpikeConfig,
-  EnduranceConfig, RateLimitConfig, AggregatedMetrics, TestReport,
+  EnduranceConfig, RateLimitConfig, BreakpointConfig, AggregatedMetrics, TestReport,
   TestConfig, SingleRequestResult, BypassOptions,
 } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -64,6 +64,19 @@ const defaultStress: StressConfig = { levels: [10, 25, 50, 100, 250, 500], level
 const defaultSpike: SpikeConfig = { normalUsers: 10, spikeUsers: 200, normalDuration: 30, spikeDuration: 30, recoveryDuration: 60 }
 const defaultEndurance: EnduranceConfig = { concurrency: 10, duration: 600 }
 const defaultRateLimit: RateLimitConfig = { totalRequests: 1000, concurrency: 50, burstMode: false }
+const defaultBreakpoint: BreakpointConfig = {
+  testType: 'breakpoint',
+  targetVirtualUsers: 100000,
+  targetRequestsPerSecond: 1000000,
+  burstDurationSeconds: 5,
+  rampStrategy: 'ramp_1s',
+  distributedNodes: 1,
+  abortConditions: {
+    maxErrorRatePercent: 50,
+    maxP99LatencyMs: 30000,
+    consecutiveTimeoutLimit: 500,
+  },
+}
 const defaultBypass: BypassOptions = { rotateIp: false, rotateUserAgent: false, bypassHeader: false, bypassHeaderName: 'X-Load-Test-Key', bypassHeaderValue: '', rotateHeaderValue: false, requestDelay: 0, retryOn429: false, retryDelay: 1000, maxRps: 0 }
 
 type AppPhase = 'config' | 'running' | 'complete'
@@ -81,6 +94,7 @@ export default function Home() {
   const [spike, setSpike] = useState<SpikeConfig>(defaultSpike)
   const [endurance, setEndurance] = useState<EnduranceConfig>(defaultEndurance)
   const [rateLimit, setRateLimit] = useState<RateLimitConfig>(defaultRateLimit)
+  const [breakpoint, setBreakpoint] = useState<BreakpointConfig>(defaultBreakpoint)
   const [bypass, setBypass] = useState<BypassOptions>(defaultBypass)
   const [allowLocal, setAllowLocal] = useState(false)
 
@@ -97,7 +111,6 @@ export default function Home() {
 
   // UI state
   const [showSafetyModal, setShowSafetyModal] = useState(false)
-  const [showHistory, setShowHistory] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [isSingleLoading, setIsSingleLoading] = useState(false)
   const [terminalLogs, setTerminalLogs] = useState<Array<{ ts: number; s: number; l: number; e: string | null }>>([])
@@ -132,6 +145,7 @@ export default function Home() {
     if (s.spike) setSpike(s.spike)
     if (s.endurance) setEndurance(s.endurance)
     if (s.rateLimit) setRateLimit(s.rateLimit)
+    if (s.breakpoint) setBreakpoint(s.breakpoint)
     if (s.bypass) setBypass(s.bypass)
     if (s.allowLocal !== undefined) setAllowLocal(s.allowLocal)
   }, [])
@@ -140,11 +154,11 @@ export default function Home() {
   useEffect(() => {
     if (urlSyncTimer.current) clearTimeout(urlSyncTimer.current)
     urlSyncTimer.current = setTimeout(() => {
-      const encoded = encodeState({ v: 1, url, name, testType, request, load, stress, spike, endurance, rateLimit, bypass, allowLocal })
+      const encoded = encodeState({ v: 1, url, name, testType, request, load, stress, spike, endurance, rateLimit, breakpoint, bypass, allowLocal })
       if (encoded) window.history.replaceState(null, '', `?cfg=${encoded}`)
     }, 600)
     return () => { if (urlSyncTimer.current) clearTimeout(urlSyncTimer.current) }
-  }, [url, name, testType, request, load, stress, spike, endurance, rateLimit, allowLocal])
+  }, [url, name, testType, request, load, stress, spike, endurance, rateLimit, breakpoint, allowLocal])
 
   // ─── Build config ────────────────────────────────────────────────────────────
 
@@ -160,6 +174,7 @@ export default function Home() {
       spike: testType === 'spike' ? spike : undefined,
       endurance: testType === 'endurance' ? endurance : undefined,
       rateLimit: testType === 'rate-limit' ? rateLimit : undefined,
+      breakpoint: testType === 'breakpoint' ? breakpoint : undefined,
       bypass: (bypass.rotateIp || bypass.rotateUserAgent || bypass.bypassHeader || bypass.retryOn429 || bypass.requestDelay > 0 || bypass.maxRps > 0) ? bypass : undefined,
       authorizedByUser: true,
     }
@@ -171,6 +186,7 @@ export default function Home() {
     if (testType === 'spike') return spike.normalUsers * spike.normalDuration + spike.spikeUsers * spike.spikeDuration + spike.normalUsers * spike.recoveryDuration
     if (testType === 'endurance') return endurance.concurrency * endurance.duration
     if (testType === 'rate-limit') return rateLimit.totalRequests
+    if (testType === 'breakpoint') return breakpoint.targetRequestsPerSecond * breakpoint.burstDurationSeconds
     return 0
   }
 
@@ -378,6 +394,7 @@ export default function Home() {
     setSpike(defaultSpike)
     setEndurance(defaultEndurance)
     setRateLimit(defaultRateLimit)
+    setBreakpoint(defaultBreakpoint)
     setBypass(defaultBypass)
     setAllowLocal(false)
     setPhase('config')
@@ -436,13 +453,6 @@ export default function Home() {
                 <span className="text-xs text-emerald-400 font-medium">LIVE</span>
               </div>
             )}
-            <button
-              onClick={() => setShowHistory(true)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[#1a3352] text-xs text-slate-400 hover:border-blue-500 hover:text-blue-300 transition-all"
-            >
-              <History size={13} />
-              History
-            </button>
           </div>
         </div>
       </header>
@@ -471,7 +481,7 @@ export default function Home() {
             <TestTypeSection selected={testType} onChange={(t) => { setTestType(t); reset() }} />
           </div>
 
-          {testType !== 'single' && (
+          {testType !== 'single' && testType !== 'breakpoint' && (
             <div className="bg-[#0d1b2e] border border-[#1a3352] rounded-2xl p-6">
               <LoadSection
                 testType={testType}
@@ -480,6 +490,17 @@ export default function Home() {
                 spike={spike} onSpike={setSpike}
                 endurance={endurance} onEndurance={setEndurance}
                 rateLimit={rateLimit} onRateLimit={setRateLimit}
+              />
+            </div>
+          )}
+
+          {testType === 'breakpoint' && (
+            <div className="bg-[#0d1b2e] border border-rose-900/30 rounded-2xl p-6">
+              <BreakpointSection
+                config={breakpoint}
+                targetUrl={url}
+                allowLocal={allowLocal}
+                onChange={setBreakpoint}
               />
             </div>
           )}
@@ -693,8 +714,6 @@ export default function Home() {
           onCancel={() => { setShowSafetyModal(false); setPendingConfig(null); setTestId(null) }}
         />
       )}
-
-      {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} />}
     </div>
   )
 }
